@@ -1,5 +1,5 @@
 """
-title: OpenWebUI Vision Router MAX - Filter (Ollama side-call + Multi-Image Strategy + Quality Gate + Retry + Verifier + Clarify) [stdlib]
+title: Vision Router MAX - Filter (Ollama side-call + Multi-Image Strategy + Quality Gate + Retry + Verifier + Clarify) [stdlib]
 author: cyberjaeger
 credits: iamg30, open-webui, atgehrhardt (base), ChatGPT (OpenAI)
 version: 0.3.9

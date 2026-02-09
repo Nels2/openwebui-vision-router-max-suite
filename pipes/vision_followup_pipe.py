@@ -22,13 +22,14 @@ class Pipe:
         self._sem = asyncio.Semaphore(max(1, self._sem_limit))
 
     class Valves(BaseModel):
-        ollama_base_url: str = Field(default="http://localhost:11434")
+        vllm_base_url: str = Field(default="http://localhost:8000/v1")
+        vllm_api_key: str = Field(default="")
         vision_model_id: str = Field(default="hf.co/openbmb/MiniCPM-V-2_6-gguf:Q4_K_M")
         timeout_s: int = Field(default=120)
 
         # low-hardware guards
-        max_output_tokens: int = Field(default=650, description="Ollama num_predict cap for follow-up call.")
-        max_concurrent_sidecalls: int = Field(default=1, description="Limit concurrent Ollama side-calls.")
+        max_output_tokens: int = Field(default=650, description="max_tokens cap for follow-up call.")
+        max_concurrent_sidecalls: int = Field(default=1, description="Limit concurrent vision side-calls.")
 
         # language
         language_preset: str = Field(default="auto", description="auto|en|pl|de|fr|es|it|... (headers stay in English)")
@@ -465,17 +466,32 @@ class Pipe:
             "Return short structured output.\n"
         )
 
+        content = [{"type": "text", "text": prompt}]
+        for img_b64 in images_b64:
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
+                }
+            )
+
         payload = {
             "model": self.valves.vision_model_id,
             "stream": False,
-            "messages": [{"role": "user", "content": prompt, "images": images_b64}],
-            "options": {"temperature": 0.2, "num_predict": int(getattr(self.valves, "max_output_tokens", 650) or 650)},
+            "messages": [{"role": "user", "content": content}],
+            "temperature": 0.2,
+            "max_tokens": int(getattr(self.valves, "max_output_tokens", 650) or 650),
         }
 
+        headers = {"Content-Type": "application/json"}
+        api_key = (getattr(self.valves, "vllm_api_key", "") or "").strip()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
         req = urllib.request.Request(
-            self.valves.ollama_base_url.rstrip("/") + "/api/chat",
+            self.valves.vllm_base_url.rstrip("/") + "/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             method="POST",
         )
 
@@ -483,7 +499,23 @@ class Pipe:
             async with self._get_sem():
                 raw = await asyncio.to_thread(self._urlopen_text, req, self.valves.timeout_s)
             data = json.loads(raw)
-            followup = data.get("message", {}).get("content", "")
+            choices = data.get("choices", [])
+            if choices:
+                content_out = choices[0].get("message", {}).get("content", "")
+                if isinstance(content_out, str):
+                    followup = content_out
+                elif isinstance(content_out, list):
+                    parts: List[str] = []
+                    for item in content_out:
+                        if isinstance(item, dict):
+                            txt = item.get("text")
+                            if isinstance(txt, str) and txt:
+                                parts.append(txt)
+                    followup = "\n".join(parts) if parts else f"VISION FOLLOW-UP ERROR: Unexpected response: {data}"
+                else:
+                    followup = f"VISION FOLLOW-UP ERROR: Unexpected response: {data}"
+            else:
+                followup = f"VISION FOLLOW-UP ERROR: Unexpected response: {data}"
         except Exception as e:
             followup = f"VISION FOLLOW-UP ERROR: {repr(e)}"
 

@@ -25,7 +25,8 @@ class Pipe:
         self._last_run_ts = 0.0
 
     class Valves(BaseModel):
-        ollama_base_url: str = Field(default="http://localhost:11434")
+        vllm_base_url: str = Field(default="http://localhost:8000/v1")
+        vllm_api_key: str = Field(default="")
         vision_model_id: str = Field(default="hf.co/openbmb/MiniCPM-V-2_6-gguf:Q4_K_M")
 
         timeout_s: int = Field(
@@ -34,8 +35,8 @@ class Pipe:
         temperature: float = Field(default=0.2)
 
         # low-hardware guards
-        max_output_tokens: int = Field(default=650, description="Ollama num_predict cap for follow-up call.")
-        max_concurrent_sidecalls: int = Field(default=1, description="Limit concurrent Ollama side-calls.")
+        max_output_tokens: int = Field(default=650, description="max_tokens cap for follow-up call.")
+        max_concurrent_sidecalls: int = Field(default=1, description="Limit concurrent vision side-calls.")
         resolve_image_urls: bool = Field(
             default=True,
             description="Attempt to download http(s) image URLs and convert them to base64.",
@@ -67,6 +68,8 @@ class Pipe:
 
         # Triggering
         enable: bool = Field(default=True)
+        max_followups_per_chat: int = Field(default=2)
+        run_on_meta_type: bool = Field(default=True)
         trigger_keywords: List[str] = Field(
             default_factory=lambda: [
                 "unclear",
@@ -284,18 +287,32 @@ class Pipe:
                 resolved.append(fetched)
         return resolved
 
-    async def _ollama_chat(self, prompt: str, images_b64: List[str]) -> str:
+    async def _vllm_chat(self, prompt: str, images_b64: List[str]) -> str:
+        content = [{"type": "text", "text": prompt}]
+        for img_b64 in images_b64:
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
+                }
+            )
+
         payload: Dict[str, Any] = {
             "model": self.valves.vision_model_id,
             "stream": False,
-            "messages": [{"role": "user", "content": prompt, "images": images_b64}],
-            "options": {"temperature": self.valves.temperature, "num_predict": int(getattr(self.valves, "max_output_tokens", 650) or 650)},
+            "messages": [{"role": "user", "content": content}],
+            "temperature": self.valves.temperature,
+            "max_tokens": int(getattr(self.valves, "max_output_tokens", 650) or 650),
         }
 
-        url = self.valves.ollama_base_url.rstrip("/") + "/api/chat"
+        url = self.valves.vllm_base_url.rstrip("/") + "/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        api_key = (getattr(self.valves, "vllm_api_key", "") or "").strip()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
-            url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+            url, data=data, headers=headers, method="POST"
         )
 
         try:
@@ -306,9 +323,22 @@ class Pipe:
                     .decode("utf-8", errors="replace")
                 )
             j = json.loads(raw)
-            return j.get("message", {}).get(
-                "content", f"VISION ERROR: Unexpected response: {j}"
-            )
+            choices = j.get("choices", [])
+            if not choices:
+                return f"VISION ERROR: Unexpected response: {j}"
+            content_out = choices[0].get("message", {}).get("content", "")
+            if isinstance(content_out, str):
+                return content_out
+            if isinstance(content_out, list):
+                parts: List[str] = []
+                for item in content_out:
+                    if isinstance(item, dict):
+                        txt = item.get("text")
+                        if isinstance(txt, str) and txt:
+                            parts.append(txt)
+                if parts:
+                    return "\n".join(parts)
+            return f"VISION ERROR: Unexpected response: {j}"
         except urllib.error.HTTPError as e:
             try:
                 body = e.read().decode("utf-8", errors="replace")
@@ -562,7 +592,7 @@ class Pipe:
         lang_hint = self._lang_hint(missing_txt)
         prompt = f"{self.valves.graph_followup_prompt}\n\nLANGUAGE:\n{lang_hint}\n\nMISSING ITEMS:\n{missing_txt}"
 
-        followup = await self._ollama_chat(prompt, images_b64)
+        followup = await self._vllm_chat(prompt, images_b64)
 
         messages.append(
             {

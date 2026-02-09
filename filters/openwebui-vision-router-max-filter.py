@@ -1,5 +1,5 @@
 """
-title: Vision Router MAX - Filter (Ollama side-call + Multi-Image Strategy + Quality Gate + Retry + Verifier + Clarify) [stdlib]
+title: Vision Router MAX - Filter (vLLM side-call + Multi-Image Strategy + Quality Gate + Retry + Verifier + Clarify) [stdlib]
 author: cyberjaeger
 credits: iamg30, open-webui, atgehrhardt (base), ChatGPT (OpenAI)
 version: 0.4.1
@@ -27,14 +27,18 @@ class Filter:
             default=0, description="Priority level for the filter operations."
         )
 
-        # --- Vision model config (Ollama) ---
+        # --- Vision model config (vLLM OpenAI-compatible) ---
         vision_model_id: str = Field(
             default="hf.co/openbmb/MiniCPM-V-2_6-gguf:Q4_K_M",
-            description="Ollama vision model NAME (from `ollama list`), not the digest.",
+            description="Vision model ID served by your vLLM OpenAI-compatible endpoint.",
         )
-        ollama_base_url: str = Field(
-            default="http://localhost:11434",
-            description="Ollama base URL reachable from OpenWebUI container.",
+        vllm_base_url: str = Field(
+            default="http://localhost:8000/v1",
+            description="vLLM OpenAI-compatible base URL reachable from OpenWebUI container.",
+        )
+        vllm_api_key: str = Field(
+            default="",
+            description="Optional API key for vLLM OpenAI-compatible endpoint. Leave empty if not required.",
         )
         vision_timeout_s: int = Field(
             default=120, description="Timeout for vision model analysis in seconds."
@@ -63,7 +67,7 @@ class Filter:
             description="Max bytes to read when resolving image URLs to base64.",
         )
         temperature: float = Field(
-            default=0.2, description="Ollama temperature for vision calls."
+            default=0.2, description="Temperature for vision calls."
         )
 
         # --- Multi-image strategy ---
@@ -120,11 +124,11 @@ class Filter:
         # --- Performance / low-hardware guards ---
         max_output_tokens: int = Field(
             default=650,
-            description="Ollama num_predict cap for side-calls (lower = faster, less CPU/RAM).",
+            description="max_tokens cap for side-calls (lower = faster, less CPU/RAM).",
         )
         max_concurrent_sidecalls: int = Field(
             default=1,
-            description="Limit concurrent Ollama side-calls to avoid overwhelming small machines.",
+            description="Limit concurrent side-calls to avoid overwhelming small machines.",
         )
         max_injected_chars: int = Field(
             default=12000,
@@ -733,8 +737,8 @@ class Filter:
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
             return resp.read().decode("utf-8", errors="replace")
 
-# ---------- stdlib ollama call ----------
-    async def _call_vision_ollama(
+# ---------- stdlib vLLM (OpenAI-compatible) call ----------
+    async def _call_vision_vllm(
         self,
         user_message: dict,
         prompt_override: Optional[str] = None,
@@ -751,7 +755,7 @@ class Filter:
             else self._extract_base64_images(user_message)
         )
         if not images_raw:
-            return "VISION ERROR: Image detected but no base64 image payload was found to send to Ollama."
+            return "VISION ERROR: Image detected but no base64 image payload was found to send to vLLM."
 
         images_b64: list[str] = []
         non_base64: list[str] = []
@@ -775,7 +779,7 @@ class Filter:
             if non_base64 and not self.valves.resolve_image_urls:
                 hint = " URL resolving is disabled; enable resolve_image_urls to fetch http(s) images."
             return (
-                "VISION ERROR: Image detected but no base64 image payload was found to send to Ollama. "
+                "VISION ERROR: Image detected but no base64 image payload was found to send to vLLM. "
                 "Non-base64 image entries were provided. "
                 f"Examples: {examples}.{hint}"
             )
@@ -788,17 +792,31 @@ class Filter:
         if extra_context:
             prompt += f"\n\nEXTRA CONTEXT:\n{extra_context}"
 
+        content = [{"type": "text", "text": prompt}]
+        for img_b64 in images_b64:
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
+                }
+            )
+
         payload = {
             "model": self.valves.vision_model_id,
             "stream": False,
-            "messages": [{"role": "user", "content": prompt, "images": images_b64}],
-            "options": {"temperature": self.valves.temperature, "num_predict": int(getattr(self.valves, "max_output_tokens", 650) or 650)},
+            "messages": [{"role": "user", "content": content}],
+            "temperature": self.valves.temperature,
+            "max_tokens": int(getattr(self.valves, "max_output_tokens", 650) or 650),
         }
 
-        url = self.valves.ollama_base_url.rstrip("/") + "/api/chat"
+        url = self.valves.vllm_base_url.rstrip("/") + "/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        api_key = (getattr(self.valves, "vllm_api_key", "") or "").strip()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
-            url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+            url, data=data, headers=headers, method="POST"
         )
 
         timeout_s = (
@@ -811,9 +829,22 @@ class Filter:
             async with self._get_sem():
                 raw = await asyncio.to_thread(self._urlopen_text, req, timeout_s)
             j = json.loads(raw)
-            return j.get("message", {}).get(
-                "content", f"VISION ERROR: Unexpected response: {j}"
-            )
+            choices = j.get("choices", [])
+            if not choices:
+                return f"VISION ERROR: Unexpected response: {j}"
+            content_out = choices[0].get("message", {}).get("content", "")
+            if isinstance(content_out, str):
+                return content_out
+            if isinstance(content_out, list):
+                parts: List[str] = []
+                for item in content_out:
+                    if isinstance(item, dict):
+                        txt = item.get("text")
+                        if isinstance(txt, str) and txt:
+                            parts.append(txt)
+                if parts:
+                    return "\n".join(parts)
+            return f"VISION ERROR: Unexpected response: {j}"
         except urllib.error.HTTPError as e:
             try:
                 body = e.read().decode("utf-8", errors="replace")
@@ -953,7 +984,7 @@ class Filter:
         )
 
         await st(f"{label}Vision pass #1…", done=False)
-        vision_text = await self._call_vision_ollama(
+        vision_text = await self._call_vision_vllm(
             user_message,
             images_override=[img_b64],
             timeout_override_s=timeout_img,
@@ -970,7 +1001,7 @@ class Filter:
             and score < self.valves.quality_threshold
         ):
             await st(f"{label}Weak (score={score}) → retry…", done=False)
-            retry_text = await self._call_vision_ollama(
+            retry_text = await self._call_vision_vllm(
                 user_message,
                 prompt_override=self.valves.repair_prompt,
                 images_override=[img_b64],
@@ -989,7 +1020,7 @@ class Filter:
                 user_text
             ):
                 await st(f"{label}OCR missing → OCR-only pass…", done=False)
-                ocr_only = await self._call_vision_ollama(
+                ocr_only = await self._call_vision_vllm(
                     user_message,
                     prompt_override=self.valves.ocr_focus_prompt,
                     images_override=[img_b64],
@@ -1007,7 +1038,7 @@ class Filter:
 
         if should_verifier:
             await st(f"{label}Verifier pass…", done=False)
-            verifier_text = await self._call_vision_ollama(
+            verifier_text = await self._call_vision_vllm(
                 user_message,
                 prompt_override=self.valves.verifier_prompt,
                 extra_context=f"CANDIDATE VISION ANALYSIS:\n{vision_text}",
@@ -1225,7 +1256,7 @@ class Filter:
         # --- BLOCK MODE (send selected images as one pack; power-user) ---
         await st(f"Block-mode vision (pack of {len(selected_imgs)} image(s))…", done=False)
 
-        vision_text = await self._call_vision_ollama(
+        vision_text = await self._call_vision_vllm(
             user_message,
             images_override=selected_imgs,
             timeout_override_s=int(self.valves.vision_timeout_s),
@@ -1235,7 +1266,7 @@ class Filter:
             score, reasons = self._quality_score(vision_text)
 
         if self.valves.enable_quality_gate and self.valves.enable_vision_retry and score < self.valves.quality_threshold:
-            retry_text = await self._call_vision_ollama(
+            retry_text = await self._call_vision_vllm(
                 user_message,
                 prompt_override=self.valves.repair_prompt,
                 images_override=selected_imgs,
@@ -1249,7 +1280,7 @@ class Filter:
         if self.valves.enable_ocr_focus_pass:
             ocr_section = self._extract_section(vision_text, "OCR")
             if (len((ocr_section or "").strip()) < 10) and self._likely_text_request(user_text):
-                ocr_only = await self._call_vision_ollama(
+                ocr_only = await self._call_vision_vllm(
                     user_message,
                     prompt_override=self.valves.ocr_focus_prompt,
                     images_override=selected_imgs,
@@ -1268,7 +1299,7 @@ class Filter:
         )
 
         if should_verifier:
-            verifier_text = await self._call_vision_ollama(
+            verifier_text = await self._call_vision_vllm(
                 user_message,
                 prompt_override=self.valves.verifier_prompt,
                 extra_context=f"CANDIDATE VISION ANALYSIS:\n{vision_text}",
